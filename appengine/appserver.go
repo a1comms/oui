@@ -1,15 +1,16 @@
-// +build appengine
-
-package appengine
+package main
 
 import (
-	"appengine"
-	"appengine/urlfetch"
-	"github.com/klauspost/oui"
+	"context"
+	"encoding/json"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/klauspost/oui"
 )
 
 var db oui.DynamicDB
@@ -20,58 +21,71 @@ var updating bool
 
 const dbUrl = "http://standards-oui.ieee.org/oui.txt"
 
-func init() {
+func main() {
 	http.HandleFunc("/_ah/warmup", warmupHandler)
 	http.HandleFunc("/", handler)
+
+	// [START setting_port]
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+		log.Printf("Defaulting to port %s", port)
+	}
+
+	log.Printf("Listening on port %s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatal(err)
+	}
+	// [END setting_port]
 }
 
 // Inital loading of DB.
-func start(c appengine.Context) error {
+func start(c context.Context) error {
 	var err error
 
 	loadWait = sync.NewCond(&mu)
-	c.Infof("Loading db on instance " + appengine.InstanceID())
+	log.Printf("Loading db...")
 	client := createClient(c, time.Second*30)
 	resp, err := client.Get(dbUrl)
 	if err != nil {
-		c.Criticalf("Error downloading:%s", err.Error())
+		log.Printf("Error downloading:%s", err.Error())
 		return err
 	}
 	defer resp.Body.Close()
 	db, err = oui.Open(resp.Body)
 
 	if err != nil {
-		c.Criticalf("Error parsing:%s", err.Error())
+		log.Printf("Error parsing:%s", err.Error())
 		return err
 	}
 	t := time.Now().Add(time.Hour * 24)
 	UpdateAt = &t
-	c.Infof("Loaded, now serving...")
+	log.Printf("Loaded, now serving...")
 	loadWait.Broadcast()
 	return nil
 }
 
 // Update DB - happens at a user request
 // - could be done via a specific URL.
-func update(c appengine.Context) {
+func update(c context.Context) {
 	var err error
-	c.Infof("Updating DB on instance " + appengine.InstanceID())
+	log.Printf("Updating DB on instance...")
 	client := createClient(c, time.Second*30)
 	resp, err := client.Get(dbUrl)
 	if err != nil {
-		c.Warningf("Error downloading:%s", err.Error())
+		log.Printf("Error downloading:%s", err.Error())
 		return
 	}
 	defer resp.Body.Close()
 	err = oui.Update(db, resp.Body)
 
 	if err != nil {
-		c.Warningf("Error parsing:%s", err.Error())
+		log.Printf("Error parsing:%s", err.Error())
 		return
 	}
 	t := time.Now().Add(time.Hour * 24)
 	UpdateAt = &t
-	c.Infof("Updated database...")
+	log.Printf("Updated database...")
 }
 
 var startOnce sync.Once
@@ -83,7 +97,7 @@ type Response struct {
 
 // Default handler
 func handler(w http.ResponseWriter, r *http.Request) {
-	c := appengine.NewContext(r)
+	c := r.Context()
 	// Load db on first request.
 	var err error
 	err = nil
@@ -92,7 +106,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		startOnce = sync.Once{}
-		c.Criticalf("unable to load db:" + err.Error())
+		log.Printf("unable to load db:" + err.Error())
 	}
 	if UpdateAt == nil {
 		loadWait.Wait()
@@ -111,9 +125,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		var j []byte
 		var err error
-		j, err = res.MarshalJSON()
+		j, err = json.Marshal(&res.Data)
 		if err != nil {
-			c.Errorf(err.Error())
+			log.Printf(err.Error())
+			return
 		}
 		w.Write(j)
 	}()
@@ -131,7 +146,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	hw, err = oui.ParseMac(mac)
 	if err != nil {
-		res.Error = err.Error() + ". Usage 'http://" + appengine.DefaultVersionHostname(c) + "/AB-CD-EF' (dashes can be colons or omitted)."
+		res.Error = err.Error() + ". Usage 'https://<host>/AB-CD-EF' (dashes can be colons or omitted)."
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -152,7 +167,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func warmupHandler(w http.ResponseWriter, r *http.Request) {
-	c := appengine.NewContext(r)
+	c := r.Context()
 	var err error
 	err = nil
 	startOnce.Do(func() {
@@ -160,16 +175,13 @@ func warmupHandler(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		startOnce = sync.Once{}
-		c.Criticalf("unable to load db:" + err.Error())
+		log.Printf("unable to load db:" + err.Error())
 	}
 }
 
 // createClient is urlfetch.Client with Deadline
-func createClient(context appengine.Context, t time.Duration) *http.Client {
+func createClient(context context.Context, t time.Duration) *http.Client {
 	return &http.Client{
-		Transport: &urlfetch.Transport{
-			Context:  context,
-			Deadline: t,
-		},
+		Transport: &http.Transport{},
 	}
 }

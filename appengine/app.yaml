@@ -1,12 +1,17 @@
-application: mac-oui
-version: 1
-runtime: go
-api_version: go1
-default_expiration: 1d
+runtime: go113
+service: mac-oui
+
+automatic_scaling:
+    max_concurrent_requests: 75
+    min_pending_latency: 100ms
+    max_pending_latency: 200ms
 
 handlers:
+- url: /favicon.ico
+  static_files: resources/static/favicon.ico
+  upload: resources/static/favicon.ico
 - url: /.*
-  script: _go_app
+  script: auto
 
 inbound_services:
 - warmup
