@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/klauspost/oui"
+
+	"cloud.google.com/go/storage"
 )
 
 var db oui.DynamicDB
@@ -21,9 +24,13 @@ var updating bool
 
 const dbUrl = "http://standards-oui.ieee.org/oui.txt"
 
+var gcsBucket string = gae_project() + ".appspot.com"
+var gcsPath string = gae_service() + "/oui.txt"
+
 func main() {
 	http.HandleFunc("/_ah/warmup", warmupHandler)
 	http.HandleFunc("/", handler)
+	http.HandleFunc("/cron/updatedb", updateHandler)
 
 	// [START setting_port]
 	port := os.Getenv("PORT")
@@ -45,23 +52,32 @@ func start(c context.Context) error {
 
 	loadWait = sync.NewCond(&mu)
 	log.Printf("Loading db...")
-	client := createClient(c, time.Second*30)
-	resp, err := client.Get(dbUrl)
-	if err != nil {
-		log.Printf("Error downloading:%s", err.Error())
-		return err
-	}
-	defer resp.Body.Close()
-	db, err = oui.Open(resp.Body)
 
+	obj, err := getObject(c)
 	if err != nil {
-		log.Printf("Error parsing:%s", err.Error())
+		log.Printf("Error getting GCS object: %s", err)
 		return err
 	}
+
+	r, err := obj.NewReader(c)
+	if err != nil {
+		log.Printf("Error downloading: %s", err)
+		return err
+	}
+	defer r.Close()
+
+	db, err = oui.Open(r)
+	if err != nil {
+		log.Printf("Error parsing: %s", err)
+		return err
+	}
+
 	t := time.Now().Add(time.Hour * 24)
 	UpdateAt = &t
+
 	log.Printf("Loaded, now serving...")
 	loadWait.Broadcast()
+
 	return nil
 }
 
@@ -69,23 +85,71 @@ func start(c context.Context) error {
 // - could be done via a specific URL.
 func update(c context.Context) {
 	var err error
+
 	log.Printf("Updating DB on instance...")
-	client := createClient(c, time.Second*30)
-	resp, err := client.Get(dbUrl)
+
+	obj, err := getObject(c)
 	if err != nil {
-		log.Printf("Error downloading:%s", err.Error())
+		log.Printf("Error getting GCS object: %s", err)
+		return
+	}
+
+	r, err := obj.NewReader(c)
+	if err != nil {
+		log.Printf("Error downloading: %s", err)
+		return
+	}
+	defer r.Close()
+
+	err = oui.Update(db, r)
+	if err != nil {
+		log.Printf("Error parsing: %s", err.Error())
+		return
+	}
+
+	t := time.Now().Add(time.Hour * 24)
+	UpdateAt = &t
+
+	log.Printf("Updated database...")
+}
+
+func updateHandler(w http.ResponseWriter, r *http.Request) {
+	c := r.Context()
+
+	obj, err := getObject(c)
+	if err != nil {
+		log.Printf("Error getting GCS object: %s", err)
+		error500Handler(w, r, err)
+		return
+	}
+
+	objW := obj.NewWriter(c)
+
+	resp, err := http.Get(dbUrl)
+	if err != nil {
+		log.Printf("Error downloading: %s", err.Error())
+		error500Handler(w, r, err)
 		return
 	}
 	defer resp.Body.Close()
-	err = oui.Update(db, resp.Body)
 
-	if err != nil {
-		log.Printf("Error parsing:%s", err.Error())
+	if _, err := io.Copy(objW, resp.Body); err != nil {
+		log.Printf("Failed to copy DB to GCS on write: %s", err)
+		error500Handler(w, r, err)
 		return
 	}
-	t := time.Now().Add(time.Hour * 24)
-	UpdateAt = &t
-	log.Printf("Updated database...")
+
+	if err := objW.Close(); err != nil {
+		log.Printf("Failed to close object for write: %s", err)
+		error500Handler(w, r, err)
+		return
+	}
+
+	http.Error(w, "OK", 200)
+}
+
+func error500Handler(w http.ResponseWriter, r *http.Request, err error) {
+	http.Error(w, "Internal Server Error", 500)
 }
 
 var startOnce sync.Once
@@ -107,6 +171,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		startOnce = sync.Once{}
 		log.Printf("unable to load db:" + err.Error())
+		error500Handler(w, r, err)
+		return
 	}
 	if UpdateAt == nil {
 		loadWait.Wait()
@@ -176,12 +242,27 @@ func warmupHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		startOnce = sync.Once{}
 		log.Printf("unable to load db:" + err.Error())
+		error500Handler(w, r, err)
+		return
 	}
 }
 
-// createClient is urlfetch.Client with Deadline
-func createClient(context context.Context, t time.Duration) *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{},
+func getObject(c context.Context) (*storage.ObjectHandle, error) {
+	client, err := storage.NewClient(c)
+	if err != nil {
+		log.Printf("Error opening GCS client: %s", err)
+		return nil, err
 	}
+
+	bkt := client.Bucket(gcsBucket)
+
+	return bkt.Object(gcsPath), nil
+}
+
+func gae_project() string {
+	return os.Getenv("GOOGLE_CLOUD_PROJECT")
+}
+
+func gae_service() string {
+	return os.Getenv("GAE_SERVICE")
 }
