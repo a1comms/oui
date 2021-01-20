@@ -19,7 +19,7 @@ var mu sync.RWMutex
 var loadWait *sync.Cond
 var updating bool
 
-const dbUrl = "https://cache.a1comms.net/oui.txt"
+const dbUrl = "http://standards-oui.ieee.org/oui.txt"
 
 func main() {
 	http.HandleFunc("/_ah/warmup", warmupHandler)
